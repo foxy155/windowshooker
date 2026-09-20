@@ -26,6 +26,9 @@ fn draw_main_viewport(app: &mut App, ctx: &egui::Context) {
     theme::apply_theme(ctx);
 
     app.pick_up_background_scan();
+    app.pick_up_memory_scan();
+    app.poll_script_runtime();
+    app.memory_tick_freeze();
 
     draw_sidebar(app, ctx);
 
@@ -69,9 +72,6 @@ fn spawn_editor_viewport(app: &mut App, ctx: &egui::Context) {
 
     let id = editor_viewport_id();
 
-    // We only need to hand the editor Arc to the closure. App itself
-    // stays inside the main update. When the OS window is closed we
-    // set floating = false via the shared Arc.
     let editor: Arc<Mutex<EditorState>> = Arc::clone(&app.editor);
 
     let _ = ctx.show_viewport_deferred(id, builder, move |viewport_ctx, _class| {
@@ -85,8 +85,6 @@ fn spawn_editor_viewport(app: &mut App, ctx: &egui::Context) {
     });
 }
 
-/// Render the editor's OS window content. We can't access `App` here,
-/// so we render a minimal shell that shares state via the editor Arc.
 fn draw_editor_in_viewport(ctx: &egui::Context, editor: Arc<Mutex<EditorState>>) {
     theme::apply_theme(ctx);
 
@@ -103,10 +101,7 @@ fn draw_editor_in_viewport(ctx: &egui::Context, editor: Arc<Mutex<EditorState>>)
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
 }
 
-/// Main viewport does nothing for the editor window; kept as a name
-/// symmetric with `draw_main_viewport` for clarity.
 fn draw_editor_viewport(_app: &mut App, _ctx: &egui::Context) {
-    // Should never be called: the editor viewport is handled by the
-    // closure in `spawn_editor_viewport`. This exists only so the
-    // update dispatch has a matching arm.
+    // Never actually called; the editor viewport is drawn by the
+    // closure inside `spawn_editor_viewport`.
 }

@@ -391,3 +391,106 @@ fn sanitize_folder_name(name: &str) -> String {
         .collect();
     cleaned.trim().trim_end_matches('.').to_string()
 }
+// ============================================================
+// SCRIPTS
+// ============================================================
+
+/// One script in a project. The source is a full SigilScript program
+/// (or a partial — the interpreter handles top-level statements).
+///
+/// A project's scripts live in `scripts.json` inside the project
+/// folder. The list is read on open and written on every edit.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Script {
+    /// Short, unique within the project. Used as the display name and
+    /// the label in the sidebar.
+    pub name: String,
+
+    /// Optional author. Free text.
+    #[serde(default)]
+    pub author: String,
+
+    /// One-line description shown in the library list.
+    #[serde(default)]
+    pub description: String,
+
+    /// Free-form tags for filtering. Unused in v1, kept for future.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// The full source code of the script.
+    #[serde(default)]
+    pub source: String,
+
+    /// ISO-8601-ish timestamp. Set on first write; updated on save.
+    #[serde(default)]
+    pub modified: String,
+
+    /// Whether the script should run automatically when the project
+    /// opens. Unused in v1.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Script {
+    /// A starter script with a header comment and a template loop.
+    /// Handed out when the user creates a new script.
+    pub fn template(name: &str) -> Self {
+        let source = format!(
+            r#"# @name        {name}
+# @author      you
+# @desc        Describe what this script does
+# @version     1.0.0
+#
+# SigilScript runs on the memory of the attached process. Every
+# `read`/`write`/`freeze` call goes through the Memory view's handle.
+#
+# Example: pin HP to 9999 while the script runs.
+#
+# addr hp = 0x7ff6a2c0 : int32
+#
+# loop every 500ms:
+#     if read(hp) < 100:
+#         write(hp, 9999)
+#         log("HP reset to 9999")
+
+log("hello from '{name}'")
+"#,
+            name = name
+        );
+
+        Self {
+            name: name.to_string(),
+            author: String::new(),
+            description: String::new(),
+            tags: Vec::new(),
+            source,
+            modified: now_string(),
+            enabled: false,
+        }
+    }
+}
+
+/// `<project>/scripts.json`
+pub fn scripts_path(folder: &Path) -> PathBuf {
+    folder.join("scripts.json")
+}
+
+/// Read every script in a project. Returns empty on missing file.
+pub fn read_scripts(folder: &Path) -> Vec<Script> {
+    let path = scripts_path(folder);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// Write the full script list. Called on every edit when autosave is
+/// on. Same autosave discipline as the project file itself.
+pub fn write_scripts(folder: &Path, scripts: &[Script]) -> Result<(), String> {
+    let path = scripts_path(folder);
+    let text = serde_json::to_string_pretty(scripts)
+        .map_err(|e| format!("serialize scripts failed: {}", e))?;
+    fs::write(&path, text)
+        .map_err(|e| format!("write scripts failed for {}: {}", path.display(), e))
+}

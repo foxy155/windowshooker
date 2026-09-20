@@ -1,4 +1,13 @@
+//! Process enumeration and access probing.
+//!
+//! Uses `sysinfo` for listing, and raw Win32 for probing whether we can
+//! open a handle with the rights the injector needs.
+
 use crate::theme;
+
+// ============================================================
+// ACCESS STATUS
+// ============================================================
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum AccessStatus {
@@ -31,6 +40,10 @@ pub struct ProcessEntry {
     pub name: String,
     pub status: AccessStatus,
 }
+
+// ============================================================
+// LOOKUP
+// ============================================================
 
 pub fn find_processes_by_name(name: &str) -> Vec<ProcessEntry> {
     use sysinfo::{ProcessesToUpdate, System};
@@ -74,6 +87,10 @@ pub fn find_process_by_pid(pid: u32) -> Option<ProcessEntry> {
     None
 }
 
+// ============================================================
+// ACCESS PROBING
+// ============================================================
+
 #[cfg(windows)]
 pub fn probe_access(pid: u32) -> AccessStatus {
     use windows::Win32::Foundation::CloseHandle;
@@ -108,4 +125,120 @@ pub fn probe_access(pid: u32) -> AccessStatus {
 #[cfg(not(windows))]
 pub fn probe_access(_pid: u32) -> AccessStatus {
     AccessStatus::Injectable
+}
+
+// ============================================================
+// PROCESS PICKER
+// ============================================================
+
+/// A row in the Memory view's process picker.
+#[derive(Clone)]
+pub struct ProcessListing {
+    pub pid: u32,
+    pub name: String,
+    /// Category used to colour the small dot next to each row.
+    pub category: &'static str,
+    /// Whether we can open it with VM read/write rights.
+    pub accessible: bool,
+}
+
+/// Enumerate every running process, sorted by name. Used by the
+/// Memory view's picker modal.
+pub fn list_processes_sorted() -> Vec<ProcessListing> {
+    use sysinfo::{ProcessesToUpdate, System};
+
+    let mut sys = System::new_all();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+
+    // Deduplicate by PID. sysinfo occasionally surfaces the same
+    // process twice when it refreshes while a process is spawning or
+    // exiting. Keep the first entry we see per PID.
+    let mut seen_pids: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
+
+    let mut out: Vec<ProcessListing> = sys
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let pid_u32 = pid.as_u32();
+            if !seen_pids.insert(pid_u32) {
+                return None;
+            }
+            let name = process.name().to_string_lossy().to_string();
+            let category = categorize(&name);
+            let accessible = probe_access(pid_u32) == AccessStatus::Injectable;
+            Some(ProcessListing {
+                pid: pid_u32,
+                name,
+                category,
+                accessible,
+            })
+        })
+        .collect();
+
+    // Sort: accessible first, then by name.
+    out.sort_by(|a, b| {
+        b.accessible.cmp(&a.accessible).then_with(|| {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+        })
+    });
+    out
+}
+
+fn categorize(name: &str) -> &'static str {
+    let n = name.to_lowercase();
+
+    // System processes
+    const SYSTEM: &[&str] = &[
+        "system",
+        "system idle process",
+        "registry",
+        "smss.exe",
+        "csrss.exe",
+        "wininit.exe",
+        "services.exe",
+        "lsass.exe",
+        "winlogon.exe",
+        "svchost.exe",
+        "fontdrvhost.exe",
+        "dwm.exe",
+        "explorer.exe",
+    ];
+    if SYSTEM.iter().any(|s| n == *s) {
+        return "system";
+    }
+
+    // Games / launchers
+    const GAME_HINTS: &[&str] = &[
+        "steam",
+        "epic",
+        "battle.net",
+        "riot",
+        "gog",
+        "unity",
+        "unreal",
+        "game",
+        "launcher",
+        "bloons",
+        "aqw",
+        "adventure",
+    ];
+    if GAME_HINTS.iter().any(|s| n.contains(s)) {
+        return "game";
+    }
+
+    // Browsers
+    const BROWSERS: &[&str] = &[
+        "chrome",
+        "firefox",
+        "msedge",
+        "brave",
+        "opera",
+        "vivaldi",
+    ];
+    if BROWSERS.iter().any(|s| n.contains(s)) {
+        return "browser";
+    }
+
+    "app"
 }

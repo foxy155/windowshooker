@@ -10,3 +10,5 @@ pub mod registry;
 pub mod scanning;
 pub mod session;
 pub mod settings;
+pub mod memory;
+pub mod script;

@@ -133,7 +133,7 @@ fn appearance_card(app: &mut App, ui: &mut egui::Ui) {
                             painter.circle_stroke(
                                 rect.center(),
                                 11.0,
-                                egui::Stroke::new(2.0, theme::text()),
+                                egui::Stroke::new(2.0_f32, theme::text()),
                             );
                         }
 

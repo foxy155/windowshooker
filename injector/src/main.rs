@@ -6,6 +6,9 @@ mod shell;
 mod state;
 mod theme;
 mod views;
+#[cfg(test)]
+mod tests;
+mod script_tests;
 
 use state::App;
 use theme::{install, Theme};

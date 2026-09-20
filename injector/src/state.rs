@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use log::Level;
@@ -14,15 +15,20 @@ use crate::core::hooks::{self, Hook, HookSummary};
 use crate::core::injection::{inject, InjectionMethod};
 use crate::core::launch::{enable_debug_privilege, launch_process, wait_for_connection};
 use crate::core::logging::{install_logger, LogEntry};
+use crate::core::memory::{self, FrozenEntry, MemoryReader, ScanHit, ValueType};
 use crate::core::packets::{Direction, PacketStore};
 use crate::core::processes::{
-    find_process_by_pid, find_processes_by_name, AccessStatus, ProcessEntry,
+    find_process_by_pid, find_processes_by_name, list_processes_sorted, AccessStatus,
+    ProcessEntry, ProcessListing,
 };
 use crate::core::scanning::{
     app_cache_path, load_cached_apps, save_apps_cache, scan_apps_native, AppGroup,
 };
+use crate::core::script::builtins::{make_builtins, BuiltinContext};
+use crate::core::script::interpreter::Interpreter;
+use crate::core::script::parser;
 use crate::core::session::{
-    self, now_string, ChangelogEntry, ChangelogKind, Project,
+    self, now_string, ChangelogEntry, ChangelogKind, Project, Script,
 };
 use crate::core::settings::Settings;
 
@@ -198,7 +204,77 @@ impl HooksTab {
     }
 }
 
+#[derive(PartialEq, Clone, Copy)]
+pub enum MemoryTab {
+    Scan,
+    Regions,
+    Freeze,
+    Scripts,
+}
+
+impl MemoryTab {
+    pub fn label(&self) -> &'static str {
+        match self {
+            MemoryTab::Scan => "Scan",
+            MemoryTab::Regions => "Regions",
+            MemoryTab::Freeze => "Freeze",
+            MemoryTab::Scripts => "Scripts",
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub enum ScriptsTab {
+    Library,
+    Edit,
+}
+
+impl ScriptsTab {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ScriptsTab::Library => "Library",
+            ScriptsTab::Edit => "Edit",
+        }
+    }
+}
+
 type ScanSlot = Arc<Mutex<Option<Result<Vec<AppGroup>, String>>>>;
+type MemScanSlot = Arc<Mutex<Option<Result<Vec<ScanHit>, String>>>>;
+
+static READER_HANDOFF: OnceLock<Mutex<Option<MemoryReader>>> = OnceLock::new();
+
+fn reader_handoff() -> &'static Mutex<Option<MemoryReader>> {
+    READER_HANDOFF.get_or_init(|| Mutex::new(None))
+}
+
+// ============================================================
+// SCRIPT RUNTIME
+// ============================================================
+
+pub struct ScriptRuntime {
+    pub source_name: String,
+    pub handle: Option<JoinHandle<()>>,
+    pub started_at: Instant,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum ScriptStatus {
+    Idle,
+    Running,
+    Stopped,
+    Error(String),
+}
+
+impl ScriptStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ScriptStatus::Idle => "idle",
+            ScriptStatus::Running => "running",
+            ScriptStatus::Stopped => "stopped",
+            ScriptStatus::Error(_) => "error",
+        }
+    }
+}
 
 pub struct App {
     pub view: View,
@@ -274,6 +350,64 @@ pub struct App {
     pub new_hook_language: CodeLanguage,
     pub editor: Arc<Mutex<EditorState>>,
     pub pending_close_tab: Option<usize>,
+
+    // ---- Memory view ----
+    pub memory_tab: MemoryTab,
+    pub mem_attach_pid: String,
+    pub mem_reader: Arc<Mutex<Option<MemoryReader>>>,
+    pub mem_scan_type: ValueType,
+    pub mem_scan_input: String,
+    pub mem_scan_results: Vec<ScanHit>,
+    pub mem_scan_undo: Vec<ScanHit>,
+    pub mem_scan_error: Option<String>,
+    pub mem_scan_in_progress: bool,
+    pub mem_scan_slot: Option<MemScanSlot>,
+    pub mem_selected_hit: Option<usize>,
+    pub mem_regions: Vec<memory::MemoryRegion>,
+    pub mem_regions_loaded: bool,
+    pub mem_selected_region: Option<usize>,
+    pub mem_hex_address: String,
+    pub mem_hex_bytes: Vec<u8>,
+    pub mem_hex_error: Option<String>,
+    pub mem_frozen: Arc<Mutex<Vec<FrozenEntry>>>,
+    pub mem_freeze_active: Arc<AtomicBool>,
+    pub mem_freeze_started: bool,
+    pub mem_status: Option<String>,
+
+    /// Free-text filter for the scan results table. Kept separate
+    /// from `mem_scan_input` so typing a filter doesn't clobber the
+    /// value you're searching for.
+    pub mem_results_filter: String,
+
+    /// Timestamp of the last live-refresh pass. Throttles re-reads
+    /// to ~30 Hz.
+    pub mem_last_refresh: Instant,
+
+    /// Persistent edit buffer for the "edit value at <addr>" widget.
+    /// Kept on App so it survives across frames.
+    pub mem_edit_buffer: String,
+
+    /// Which address `mem_edit_buffer` is currently editing. When the
+    /// selected row changes, the buffer is reset.
+    pub mem_edit_buffer_for: Option<u64>,
+
+    /// Process picker state.
+    pub mem_proc_picker_open: bool,
+    pub mem_proc_search: String,
+    pub mem_proc_list: Vec<ProcessListing>,
+    pub mem_proc_list_loaded: bool,
+    pub mem_proc_selected: Option<u32>,
+
+    // ---- Scripts ----
+    pub scripts: Vec<Script>,
+    pub scripts_loaded: bool,
+    pub scripts_tab: ScriptsTab,
+    pub active_script_idx: Option<usize>,
+    pub script_output: Arc<Mutex<Vec<String>>>,
+    pub script_runtime: Option<ScriptRuntime>,
+    pub script_stop: Arc<AtomicBool>,
+    pub script_status: ScriptStatus,
+    pub script_new_name: String,
 }
 
 impl App {
@@ -371,6 +505,45 @@ impl App {
             new_hook_language: CodeLanguage::Cpp,
             editor: Arc::new(Mutex::new(EditorState::new())),
             pending_close_tab: None,
+            memory_tab: MemoryTab::Scan,
+            mem_attach_pid: String::new(),
+            mem_reader: Arc::new(Mutex::new(None)),
+            mem_scan_type: ValueType::Int32,
+            mem_scan_input: String::new(),
+            mem_scan_results: Vec::new(),
+            mem_scan_undo: Vec::new(),
+            mem_scan_error: None,
+            mem_scan_in_progress: false,
+            mem_scan_slot: None,
+            mem_selected_hit: None,
+            mem_regions: Vec::new(),
+            mem_regions_loaded: false,
+            mem_selected_region: None,
+            mem_hex_address: String::new(),
+            mem_hex_bytes: Vec::new(),
+            mem_hex_error: None,
+            mem_frozen: Arc::new(Mutex::new(Vec::new())),
+            mem_freeze_active: Arc::new(AtomicBool::new(false)),
+            mem_freeze_started: false,
+            mem_status: None,
+            mem_results_filter: String::new(),
+            mem_last_refresh: Instant::now(),
+            mem_edit_buffer: String::new(),
+            mem_edit_buffer_for: None,
+            mem_proc_picker_open: false,
+            mem_proc_search: String::new(),
+            mem_proc_list: Vec::new(),
+            mem_proc_list_loaded: false,
+            mem_proc_selected: None,
+            scripts: Vec::new(),
+            scripts_loaded: false,
+            scripts_tab: ScriptsTab::Library,
+            active_script_idx: None,
+            script_output: Arc::new(Mutex::new(Vec::new())),
+            script_runtime: None,
+            script_stop: Arc::new(AtomicBool::new(false)),
+            script_status: ScriptStatus::Idle,
+            script_new_name: String::new(),
         };
 
         if let Some(cached) = load_cached_apps() {
@@ -389,9 +562,17 @@ impl App {
 
     // ---------- Editor helpers ----------
 
-    /// Convenience: lock the editor state. Panics if poisoned.
     pub fn editor(&self) -> std::sync::MutexGuard<'_, EditorState> {
         self.editor.lock().expect("editor mutex poisoned")
+    }
+
+    pub fn with_reader<R>(&self, f: impl FnOnce(&MemoryReader) -> R) -> Option<R> {
+        let guard = self.mem_reader.lock().ok()?;
+        guard.as_ref().map(f)
+    }
+
+    fn reader_slot(&self) -> std::sync::MutexGuard<'_, Option<MemoryReader>> {
+        self.mem_reader.lock().expect("memory reader mutex poisoned")
     }
 
     // ---------- Settings helpers ----------
@@ -432,6 +613,7 @@ impl App {
                 self.refresh_project_list();
                 self.log_change(ChangelogKind::Created, format!("created '{}'", name));
                 self.sessions_tab = SessionsTab::OpenProject;
+                self.refresh_scripts();
             }
             Err(e) => {
                 log::error!(target: "project", "{}", e);
@@ -471,6 +653,7 @@ impl App {
                 );
 
                 self.sessions_tab = SessionsTab::OpenProject;
+                self.refresh_scripts();
             }
             Err(e) => {
                 log::error!(target: "project", "{}", e);
@@ -486,6 +669,11 @@ impl App {
         self.project_dirty = false;
         self.rename_buffer.clear();
         self.sessions_tab = SessionsTab::AllProjects;
+
+        self.stop_script();
+        self.scripts.clear();
+        self.active_script_idx = None;
+        self.scripts_loaded = false;
     }
 
     pub fn save_project(&mut self) {
@@ -913,6 +1101,670 @@ impl App {
         }
     }
 
+    // ---------- Memory helpers ----------
+
+    pub fn memory_attach(&mut self, pid_str: &str) {
+        let trimmed = pid_str.trim();
+        let pid: u32 = match trimmed.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                self.mem_status = Some(format!("'{}' is not a valid PID", trimmed));
+                return;
+            }
+        };
+
+        self.stop_memory_freeze();
+
+        match MemoryReader::open(pid) {
+            Ok(reader) => {
+                log::info!(target: "memory", "attached to PID {}", pid);
+                *self.reader_slot() = Some(reader);
+                self.mem_regions.clear();
+                self.mem_regions_loaded = false;
+                self.mem_scan_results.clear();
+                self.mem_scan_undo.clear();
+                self.mem_selected_hit = None;
+                self.mem_edit_buffer.clear();
+                self.mem_edit_buffer_for = None;
+                self.mem_status = Some(format!("attached to PID {}", pid));
+            }
+            Err(e) => {
+                log::error!(target: "memory", "{}", e);
+                self.mem_status = Some(e);
+            }
+        }
+    }
+
+    pub fn memory_detach(&mut self) {
+        self.stop_memory_freeze();
+        {
+            let slot = self.reader_slot();
+            if slot.is_some() {
+                log::info!(target: "memory", "detached");
+            }
+        }
+        *self.reader_slot() = None;
+        self.mem_regions.clear();
+        self.mem_regions_loaded = false;
+        self.mem_scan_results.clear();
+        self.mem_scan_undo.clear();
+        self.mem_selected_hit = None;
+        self.mem_selected_region = None;
+        self.mem_edit_buffer.clear();
+        self.mem_edit_buffer_for = None;
+        self.mem_status = Some("detached".into());
+    }
+
+    pub fn memory_load_regions(&mut self) {
+        let regions = self.with_reader(|r| r.regions());
+        match regions {
+            Some(r) => {
+                log::info!(target: "memory", "loaded {} regions", r.len());
+                self.mem_regions = r;
+                self.mem_regions_loaded = true;
+                self.mem_selected_region = None;
+            }
+            None => {
+                self.mem_status = Some("not attached".into());
+            }
+        }
+    }
+
+    pub fn memory_start_scan(&mut self) {
+        if self.mem_scan_in_progress {
+            return;
+        }
+
+        let taken: Option<MemoryReader> = {
+            let mut slot = self.reader_slot();
+            slot.take()
+        };
+
+        let Some(reader) = taken else {
+            self.mem_status = Some("not attached".into());
+            return;
+        };
+
+        let needle = match memory::parse_value(self.mem_scan_type, &self.mem_scan_input) {
+            Ok(v) => v,
+            Err(e) => {
+                self.mem_scan_error = Some(e);
+                {
+                    let mut slot = self.reader_slot();
+                    *slot = Some(reader);
+                }
+                return;
+            }
+        };
+        if needle.is_empty() {
+            self.mem_scan_error = Some("value is empty".into());
+            {
+                let mut slot = self.reader_slot();
+                *slot = Some(reader);
+            }
+            return;
+        }
+
+        let slot: MemScanSlot = Arc::new(Mutex::new(None));
+        let slot_clone = Arc::clone(&slot);
+        let needle_clone = needle.clone();
+        let kind = self.mem_scan_type;
+
+        self.mem_scan_in_progress = true;
+        self.mem_scan_error = None;
+        self.mem_status = Some("scanning...".into());
+
+        std::thread::spawn(move || {
+            let hits = memory::scan_typed(&reader, &needle_clone, kind, 10_000);
+            if let Ok(mut g) = reader_handoff().lock() {
+                *g = Some(reader);
+            }
+            if let Ok(mut g) = slot_clone.lock() {
+                *g = Some(Ok(hits));
+            }
+        });
+
+        self.mem_scan_slot = Some(slot);
+    }
+
+    pub fn pick_up_memory_scan(&mut self) {
+        {
+            let mut slot = self.reader_slot();
+            if slot.is_none() {
+                if let Ok(mut g) = reader_handoff().lock() {
+                    if let Some(r) = g.take() {
+                        *slot = Some(r);
+                    }
+                }
+            }
+        }
+
+        let Some(scan_slot) = &self.mem_scan_slot else { return; };
+        let taken = {
+            match scan_slot.lock() {
+                Ok(mut g) => g.take(),
+                Err(_) => None,
+            }
+        };
+        let Some(result) = taken else { return; };
+
+        self.mem_scan_in_progress = false;
+        self.mem_scan_slot = None;
+
+        match result {
+            Ok(hits) => {
+                let n = hits.len();
+                log::info!(target: "memory", "scan found {} hits", n);
+                self.mem_scan_undo = Vec::new();
+                self.mem_scan_results = hits;
+                self.mem_selected_hit = None;
+                self.mem_edit_buffer.clear();
+                self.mem_edit_buffer_for = None;
+                self.mem_status = Some(format!("{} hits", n));
+            }
+            Err(e) => {
+                log::error!(target: "memory", "{}", e);
+                self.mem_scan_error = Some(e);
+                self.mem_status = Some("scan failed".into());
+            }
+        }
+    }
+
+    pub fn memory_refine_scan(&mut self) {
+        let needle = match memory::parse_value(self.mem_scan_type, &self.mem_scan_input) {
+            Ok(v) => v,
+            Err(e) => {
+                self.mem_scan_error = Some(e);
+                return;
+            }
+        };
+
+        let before = self.mem_scan_results.len();
+        let old = std::mem::take(&mut self.mem_scan_results);
+
+        let refined = self.with_reader(|r| {
+            let mut out: Vec<ScanHit> = Vec::new();
+            for hit in &old {
+                let len = match hit.kind {
+                    ValueType::All => 4,
+                    ValueType::Bytes | ValueType::String => needle.len().max(1),
+                    other => other.byte_size().max(1),
+                };
+                if let Ok(buf) = r.read(hit.address, len) {
+                    if buf.len() == len && buf.as_slice() == needle {
+                        out.push(hit.clone());
+                    }
+                }
+            }
+            out
+        });
+
+        match refined {
+            Some(v) => {
+                let after = v.len();
+                self.mem_scan_undo = old;
+                self.mem_scan_results = v;
+                self.mem_selected_hit = None;
+                self.mem_edit_buffer.clear();
+                self.mem_edit_buffer_for = None;
+                self.mem_status = Some(format!("refined {} -> {} hits", before, after));
+                log::info!(target: "memory", "refined {} -> {}", before, after);
+            }
+            None => {
+                self.mem_scan_results = old;
+                self.mem_status = Some("not attached".into());
+            }
+        }
+    }
+
+    pub fn memory_undo_scan(&mut self) {
+        if self.mem_scan_undo.is_empty() {
+            self.mem_status = Some("nothing to undo".into());
+            return;
+        }
+        let n = self.mem_scan_undo.len();
+        self.mem_scan_results = std::mem::take(&mut self.mem_scan_undo);
+        self.mem_selected_hit = None;
+        self.mem_edit_buffer.clear();
+        self.mem_edit_buffer_for = None;
+        self.mem_status = Some(format!("restored {} hits", n));
+    }
+
+    pub fn memory_clear_results(&mut self) {
+        self.mem_scan_results.clear();
+        self.mem_scan_undo.clear();
+        self.mem_selected_hit = None;
+        self.mem_edit_buffer.clear();
+        self.mem_edit_buffer_for = None;
+        self.mem_status = Some("cleared".into());
+    }
+
+    pub fn memory_refresh_visible_values(&mut self) {
+        const REFRESH_INTERVAL: Duration = Duration::from_millis(33);
+        const MAX_REFRESH: usize = 500;
+
+        if self.mem_scan_results.is_empty() {
+            return;
+        }
+        if self.mem_last_refresh.elapsed() < REFRESH_INTERVAL {
+            return;
+        }
+        self.mem_last_refresh = Instant::now();
+
+        let taken: Option<MemoryReader> = {
+            let mut slot = self.reader_slot();
+            slot.take()
+        };
+        let Some(reader) = taken else { return; };
+
+        let n = self.mem_scan_results.len().min(MAX_REFRESH);
+        for i in 0..n {
+            memory::refresh_hit(&reader, &mut self.mem_scan_results[i]);
+        }
+
+        {
+            let mut slot = self.reader_slot();
+            *slot = Some(reader);
+        }
+    }
+
+    pub fn memory_read_hex(&mut self, address: u64, len: usize) {
+        let result = self.with_reader(|r| r.read(address, len));
+        match result {
+            Some(Ok(bytes)) => {
+                self.mem_hex_address = format!("{:#x}", address);
+                self.mem_hex_bytes = bytes;
+                self.mem_hex_error = None;
+            }
+            Some(Err(e)) => {
+                self.mem_hex_error = Some(e);
+                self.mem_hex_bytes.clear();
+            }
+            None => {
+                self.mem_hex_error = Some("not attached".into());
+            }
+        }
+    }
+
+    pub fn memory_write_hex(&mut self) {
+        let addr_str = self.mem_hex_address.trim().trim_start_matches("0x");
+        let Ok(addr) = u64::from_str_radix(addr_str, 16) else {
+            self.mem_hex_error = Some("address is not valid hex".into());
+            return;
+        };
+        let bytes = self.mem_hex_bytes.clone();
+        let result = self.with_reader(|r| r.write(addr, &bytes));
+        match result {
+            Some(Ok(())) => {
+                self.mem_hex_error = None;
+                self.mem_status = Some(format!(
+                    "wrote {} bytes at {:#x}",
+                    bytes.len(),
+                    addr
+                ));
+            }
+            Some(Err(e)) => {
+                self.mem_hex_error = Some(e);
+            }
+            None => {
+                self.mem_hex_error = Some("not attached".into());
+            }
+        }
+    }
+
+    pub fn memory_write_value(&mut self, address: u64, value_str: &str) {
+        let ty = self.mem_scan_type;
+        let write_ty = if ty == ValueType::All {
+            let hit = self.mem_scan_results.iter().find(|h| h.address == address);
+            hit.map(|h| h.kind).unwrap_or(ValueType::Int32)
+        } else {
+            ty
+        };
+        let bytes = match memory::parse_value(write_ty, value_str) {
+            Ok(v) => v,
+            Err(e) => {
+                self.mem_status = Some(e);
+                return;
+            }
+        };
+        let result = self.with_reader(|r| r.write(address, &bytes));
+        match result {
+            Some(Ok(())) => {
+                self.mem_status = Some(format!("wrote {} at {:#x}", value_str, address));
+            }
+            Some(Err(e)) => {
+                self.mem_status = Some(e);
+            }
+            None => {
+                self.mem_status = Some("not attached".into());
+            }
+        }
+    }
+
+    pub fn memory_toggle_freeze(&mut self, hit_index: usize) {
+        let ty = self.mem_scan_type;
+
+        let (newly_frozen, to_remove) = {
+            let Some(hit) = self.mem_scan_results.get(hit_index) else {
+                return;
+            };
+            if hit.frozen {
+                (None, Some(hit.address))
+            } else {
+                (Some((hit.address, hit.value.clone(), hit.kind)), None)
+            }
+        };
+
+        if let Some(addr) = to_remove {
+            if let Some(hit) = self.mem_scan_results.get_mut(hit_index) {
+                hit.frozen = false;
+            }
+            if let Ok(mut l) = self.mem_frozen.lock() {
+                l.retain(|e| e.address != addr);
+            }
+            return;
+        }
+
+        let Some((addr, value_str, hit_kind)) = newly_frozen else { return; };
+
+        let effective_ty = if ty == ValueType::All { hit_kind } else { ty };
+
+        let len = match effective_ty {
+            ValueType::Int8 | ValueType::Uint8 => 1,
+            ValueType::Int16 | ValueType::Uint16 => 2,
+            ValueType::Int32 | ValueType::Uint32 | ValueType::Float => 4,
+            ValueType::Int64 | ValueType::Uint64 | ValueType::Double => 8,
+            ValueType::Bytes | ValueType::String => {
+                memory::parse_value(effective_ty, &value_str)
+                    .map(|v| v.len())
+                    .unwrap_or(1)
+            }
+            ValueType::All => 4,
+        };
+
+        let fresh = self.with_reader(|r| r.read(addr, len));
+        let fresh = match fresh {
+            Some(Ok(b)) => b,
+            Some(Err(e)) => {
+                self.mem_status = Some(e);
+                return;
+            }
+            None => {
+                self.mem_status = Some("not attached".into());
+                return;
+            }
+        };
+
+        if let Some(hit) = self.mem_scan_results.get_mut(hit_index) {
+            hit.frozen = true;
+        }
+        if let Ok(mut l) = self.mem_frozen.lock() {
+            l.retain(|e| e.address != addr);
+            l.push(FrozenEntry {
+                address: addr,
+                value_type: effective_ty,
+                bytes: fresh,
+            });
+        }
+
+        if !self.mem_freeze_started {
+            self.mem_freeze_started = true;
+            self.mem_freeze_active.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn memory_tick_freeze(&mut self) {
+        if !self.mem_freeze_active.load(Ordering::Relaxed) {
+            return;
+        }
+        let list = match self.mem_frozen.lock() {
+            Ok(l) => l.clone(),
+            Err(_) => return,
+        };
+        if list.is_empty() {
+            return;
+        }
+        let _ = self.with_reader(|r| {
+            for entry in &list {
+                let _ = r.write(entry.address, &entry.bytes);
+            }
+        });
+    }
+
+    pub fn memory_set_frozen_bytes(&mut self, address: u64, bytes: Vec<u8>) {
+        if let Ok(mut l) = self.mem_frozen.lock() {
+            for e in l.iter_mut() {
+                if e.address == address {
+                    e.bytes = bytes.clone();
+                }
+            }
+        }
+    }
+
+    pub fn stop_memory_freeze(&mut self) {
+        self.mem_freeze_active.store(false, Ordering::Relaxed);
+        self.mem_freeze_started = false;
+        if let Ok(mut l) = self.mem_frozen.lock() {
+            l.clear();
+        }
+        for hit in &mut self.mem_scan_results {
+            hit.frozen = false;
+        }
+    }
+
+    // ---------- Process picker ----------
+
+    pub fn memory_open_proc_picker(&mut self) {
+        self.mem_proc_picker_open = true;
+        self.memory_refresh_proc_list();
+    }
+
+    pub fn memory_close_proc_picker(&mut self) {
+        self.mem_proc_picker_open = false;
+        self.mem_proc_search.clear();
+        self.mem_proc_selected = None;
+    }
+
+    pub fn memory_refresh_proc_list(&mut self) {
+        self.mem_proc_list = list_processes_sorted();
+        self.mem_proc_list_loaded = true;
+        log::info!(
+            target: "memory",
+            "process picker: loaded {} processes",
+            self.mem_proc_list.len()
+        );
+    }
+
+    pub fn memory_attach_selected(&mut self) {
+        let Some(pid) = self.mem_proc_selected else {
+            return;
+        };
+        self.memory_attach(&pid.to_string());
+        self.memory_close_proc_picker();
+    }
+
+    // ---------- Script helpers ----------
+
+    pub fn refresh_scripts(&mut self) {
+        let Some(p) = &self.current_project else {
+            self.scripts.clear();
+            self.scripts_loaded = true;
+            return;
+        };
+        let folder = p.folder.clone();
+        self.scripts = session::read_scripts(&folder);
+        self.scripts_loaded = true;
+        log::info!(target: "scripts", "loaded {} scripts", self.scripts.len());
+    }
+
+    pub fn save_scripts(&mut self) {
+        let Some(p) = &self.current_project else { return; };
+        let folder = p.folder.clone();
+        match session::write_scripts(&folder, &self.scripts) {
+            Ok(()) => {
+                log::info!(target: "scripts", "saved {} scripts", self.scripts.len());
+            }
+            Err(e) => log::error!(target: "scripts", "{}", e),
+        }
+    }
+
+    pub fn create_script(&mut self, name: &str) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.scripts.iter().any(|s| s.name == trimmed) {
+            log::warn!(target: "scripts", "script '{}' already exists", trimmed);
+            return;
+        }
+        let s = Script::template(trimmed);
+        self.scripts.push(s);
+        self.active_script_idx = Some(self.scripts.len() - 1);
+        self.scripts_tab = ScriptsTab::Edit;
+        self.save_scripts();
+    }
+
+    pub fn delete_script(&mut self, idx: usize) {
+        if idx >= self.scripts.len() {
+            return;
+        }
+        let removed = self.scripts.remove(idx);
+        log::info!(target: "scripts", "deleted '{}'", removed.name);
+        self.active_script_idx = match self.active_script_idx {
+            Some(a) if a == idx => {
+                if self.scripts.is_empty() { None } else { Some(a.min(self.scripts.len() - 1)) }
+            }
+            Some(a) if a > idx => Some(a - 1),
+            other => other,
+        };
+        self.save_scripts();
+    }
+
+    pub fn active_script(&self) -> Option<&Script> {
+        self.active_script_idx.and_then(|i| self.scripts.get(i))
+    }
+
+    pub fn active_script_mut(&mut self) -> Option<&mut Script> {
+        self.active_script_idx.and_then(|i| self.scripts.get_mut(i))
+    }
+
+    pub fn push_script_output(&self, line: String) {
+        if let Ok(mut out) = self.script_output.lock() {
+            out.push(line);
+            if out.len() > 5000 {
+                let n = out.len() - 5000;
+                out.drain(0..n);
+            }
+        }
+    }
+
+    pub fn start_script(&mut self) {
+        if self.script_runtime.is_some() {
+            log::warn!(target: "scripts", "a script is already running");
+            return;
+        }
+        let Some(script) = self.active_script().cloned() else {
+            self.push_script_output("[error] no script selected".into());
+            self.script_status = ScriptStatus::Error("no script selected".into());
+            return;
+        };
+
+        let program = match parser::parse(&script.source) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!("[error] parse {}:{}: {}", e.line, e.col, e.message);
+                log::error!(target: "scripts", "{}", msg);
+                self.push_script_output(msg);
+                self.script_status = ScriptStatus::Error(format!("{}:{}", e.line, e.col));
+                return;
+            }
+        };
+
+        if let Ok(mut out) = self.script_output.lock() {
+            out.clear();
+        }
+
+        let stop = Arc::clone(&self.script_stop);
+        stop.store(false, Ordering::Relaxed);
+
+        let output = Arc::clone(&self.script_output);
+        let reader = Arc::clone(&self.mem_reader);
+        let frozen = Arc::clone(&self.mem_frozen);
+        let freeze_active = Arc::clone(&self.mem_freeze_active);
+
+        let name = script.name.clone();
+        let started_at = Instant::now();
+
+        self.push_script_output(format!("[start] running '{}'", name));
+
+        let handle = thread::spawn(move || {
+            let ctx = BuiltinContext {
+                reader,
+                log: Arc::clone(&output),
+                stop: Arc::clone(&stop),
+                start_time: Instant::now(),
+                frozen,
+                freeze_active,
+            };
+            let builtins = make_builtins(ctx);
+
+            let result = {
+                let mut interp =
+                    Interpreter::new(builtins, Arc::clone(&output), Arc::clone(&stop));
+                interp.run(&program)
+            };
+
+            if let Ok(mut out) = output.lock() {
+                match &result {
+                    Ok(_) => out.push("[done] script finished".into()),
+                    Err(e) => out.push(format!(
+                        "[error] {}:{}: {}",
+                        e.line, e.col, e.message
+                    )),
+                }
+                if out.len() > 5000 {
+                    let n = out.len() - 5000;
+                    out.drain(0..n);
+                }
+            }
+        });
+
+        self.script_runtime = Some(ScriptRuntime {
+            source_name: name,
+            handle: Some(handle),
+            started_at,
+        });
+        self.script_status = ScriptStatus::Running;
+    }
+
+    pub fn stop_script(&mut self) {
+        if self.script_runtime.is_none() {
+            return;
+        }
+        self.script_stop.store(true, Ordering::Relaxed);
+        self.push_script_output("[stop] requested".into());
+        self.script_status = ScriptStatus::Stopped;
+    }
+
+    pub fn poll_script_runtime(&mut self) {
+        let Some(rt) = self.script_runtime.as_mut() else { return; };
+        let finished = match &rt.handle {
+            Some(h) => h.is_finished(),
+            None => true,
+        };
+        if !finished {
+            return;
+        }
+        let Some(rt) = self.script_runtime.take() else { return; };
+        if let Some(h) = rt.handle {
+            let _ = h.join();
+        }
+        if !matches!(self.script_status, ScriptStatus::Error(_)) {
+            self.script_status = ScriptStatus::Idle;
+        }
+        log::info!(target: "scripts", "script '{}' finished", rt.source_name);
+    }
+
     // ---------- Scanning ----------
 
     pub fn spawn_scan(&mut self) {
@@ -1088,6 +1940,8 @@ impl App {
 
         log::info!(target: "shutdown", "starting injector shutdown");
 
+        self.stop_script();
+
         if self.project_dirty && self.current_project.is_some() {
             log::info!(target: "shutdown", "autosaving open project before exit");
             self.save_project();
@@ -1100,6 +1954,8 @@ impl App {
                 log::info!(target: "shutdown", "autosaved {} editor tab(s)", saved);
             }
         }
+
+        self.stop_memory_freeze();
 
         let ok = self.send_control_message(b"shutdown");
         if ok {

@@ -4,10 +4,10 @@
 //! popped out as a real OS window via `app.rs`. Editor state is
 //! shared via `Arc<Mutex<EditorState>>`.
 
-use egui::Ui;
+
 use crate::core::code_editor::CodeLanguage;
 use crate::core::hooks::{
-    self, Hook, HookParam, ParamKind, ParamValue,
+    self, HookParam, ParamKind, ParamValue,
 };
 use crate::state::{App, HooksTab};
 use crate::theme;
