@@ -1,0 +1,3 @@
+[workspace]
+members = ["injector", "hook_dll"]
+resolver = "2"
